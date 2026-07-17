@@ -14,6 +14,7 @@ Linear 周巡查 bot v2 —— 面向迁移后的运营模型(9 项目单 owner 
 import json
 import os
 import sys
+import time
 from datetime import datetime, timezone, date
 from urllib import request, error
 
@@ -28,6 +29,11 @@ MAX_ROWS = 20                                    # 每段最多列多少行
 TEAM_ID = "edcafc58-b719-4c02-923c-21b70e7e830c"     # Data Set (DTS)
 NORTH_STAR_PROJECT_ID = "7364cd38-c394-40be-9c59-2a3422acc6da"  # 数据总览
 DASHBOARD_URL = ""     # 填 Databricks 入库量/覆盖率看板链接;留空则显示"见看板"文字
+
+# ② 实时入库数(bot 每周查一次 Databricks)。token/warehouse 走 GitHub secret,host 非机密可硬编。
+DATABRICKS_HOST = "dbc-83c969e1-3439.cloud.databricks.com"
+DATABRICKS_TABLE = "meshy_3d.silver.model_normalize_combined"
+NORTH_STAR_TARGET = 12_000_000   # 年底入库总量目标 12M
 
 # 9 个项目:(name, id, lead 显示名)
 PROJECTS = [
@@ -45,9 +51,22 @@ PROJECTS = [
 # 名字 → Slack user id(填了才会真正 @人;没填的用纯文本 @名字,不会通知)
 # 用 Slack 里 "复制成员 ID" 获取,格式如 U04UP2HKEUF
 MENTIONS = {
-    "Kai": "U04UP2HKEUF",
-    # "Ivan": "U...", "Yaqi": "U...", "Zee": "U...", "Noah": "U...",
-    # "Sage": "U...", "River": "U...", "Jianqiao": "U...",
+    # key = Linear 显示名(带昵称前缀,和脚本实际读到的一致);value = Slack user id
+    "kaitian": "U04UP2HKEUF",
+    "ivanyifeichen": "U07L36K9YLX",
+    "zeezizhenli": "U0937391ZAQ",
+    "yaqiding": "U09KGM0T6TY",
+    "noahrunnandu": "U091WJNGVB3",
+    "sageshujunchen": "U0A86CRV66N",
+    "jianqiaogong": "U0AAB01J1C4",       # River / Jianqiao(同一人)
+    "junhe": "U09FD60C70S",
+    "yansongxue": "U096CEJCY2Z",
+    "shiyaoliu": "U0B2ZPJA7GB",
+    "vanchenzhuofan": "U0B79R06G1L",
+    "caseyhanyuzhang": "U0AP8JBU94G",
+    "mengguolijin": "U0APW51DN0J",
+    "jinxuetai": "U0A35P4GMMY",
+    # 未列的人自动退回纯文本 @名字(不弹通知),按需再加
 }
 
 LINEAR_API = "https://api.linear.app/graphql"
@@ -105,6 +124,45 @@ def load_dotenv():
             continue
         k, v = line.split("=", 1)
         os.environ.setdefault(k.strip(), v.strip())
+
+
+def query_databricks():
+    """查实时入库总量 + 上月增量。任何缺配置/失败都返回 None(② 退回文字版,不影响其它段)。"""
+    host = os.environ.get("DATABRICKS_HOST") or DATABRICKS_HOST
+    token = os.environ.get("DATABRICKS_TOKEN")
+    wid = os.environ.get("DATABRICKS_WAREHOUSE_ID")
+    if not (host and token and wid):
+        return None
+    sql = (
+        "SELECT count(*) AS total, "
+        "count_if(ingestion_datetime >= add_months(date_trunc('month', current_date()), -1) "
+        "AND ingestion_datetime < date_trunc('month', current_date())) AS last_month "
+        "FROM " + DATABRICKS_TABLE
+    )
+    base = f"https://{host}/api/2.0/sql/statements/"
+    hdr = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    try:
+        body = json.dumps({"warehouse_id": wid, "statement": sql,
+                           "wait_timeout": "30s", "on_wait_timeout": "CONTINUE"}).encode()
+        with request.urlopen(request.Request(base, data=body, headers=hdr, method="POST"), timeout=45) as r:
+            d = json.loads(r.read().decode())
+        sid = d.get("statement_id")
+        for _ in range(10):
+            state = d.get("status", {}).get("state")
+            if state == "SUCCEEDED":
+                break
+            if state in ("FAILED", "CANCELED", "CLOSED") or not sid:
+                return None
+            time.sleep(3)
+            with request.urlopen(request.Request(base + sid, headers=hdr), timeout=30) as r2:
+                d = json.loads(r2.read().decode())
+        if d.get("status", {}).get("state") != "SUCCEEDED":
+            return None
+        row = d["result"]["data_array"][0]
+        return {"total": int(row[0]), "last_month": int(row[1])}
+    except Exception as e:
+        print("Databricks 查询失败(② 退回文字版):", str(e)[:150], file=sys.stderr)
+        return None
 
 
 # ====== 工具 ======
@@ -232,7 +290,7 @@ def iso_week():
     return f"{y}-W{w:02d}"
 
 
-def build_message(stale_updates, north, risk, overdue, triage):
+def build_message(stale_updates, north, risk, overdue, triage, ingest=None):
     week = iso_week()
     lines = [f"📋 *数据集 Linear 周巡查 · {week}*", ""]
 
@@ -249,14 +307,15 @@ def build_message(stale_updates, north, risk, overdue, triage):
 
     # ②
     lines.append("*② Milestone 进度 / 风险*")
+    if ingest:
+        total, gap = ingest["total"], NORTH_STAR_TARGET - ingest["total"]
+        lines.append(f"北极星入库总量:*{total/1e6:.2f}M / 12M*（还差 {gap/1e6:.2f}M ｜ 上月入库 +{ingest['last_month']/1e4:.1f}万 ｜ 目标 ~60万/月）")
     if north:
-        lines.append("北极星:" + " · ".join(north))
+        lines.append("里程碑:" + " · ".join(north))
     for r in risk[:MAX_ROWS]:
         lines.append(r)
-    if DASHBOARD_URL:
-        lines.append(f"实时入库量看板:{DASHBOARD_URL}")
-    else:
-        lines.append("_实时入库量 / 覆盖率见 Databricks 看板;对照 ~60 万/月轨迹判断进度_")
+    if not ingest:
+        lines.append(f"实时入库量看板:{DASHBOARD_URL}" if DASHBOARD_URL else "_实时入库量见 Databricks 看板_")
     lines.append("")
 
     # ③
@@ -335,6 +394,7 @@ def main():
         stale_updates = check_project_updates(projects_by_id, now)
         north, risk = collect_milestones(projects_by_id, now)
         overdue, triage = split_issues(issues, now)
+        ingest = query_databricks()   # 实时入库数;失败自动 None
     except Exception as e:
         msg = f"⚠️ 周巡查 bot 执行异常: {str(e)[:200]}"
         print(msg, file=sys.stderr)
@@ -345,10 +405,10 @@ def main():
                 pass
         return 1
 
-    text = build_message(stale_updates, north, risk, overdue, triage)
+    text = build_message(stale_updates, north, risk, overdue, triage, ingest)
 
     print("[3/3] 输出…")
-    print(f"      断更 {len(stale_updates)} / 北极星 {len(north)} / 滞后 {len(risk)} / 逾期 {len(overdue)} / Triage {len(triage)}")
+    print(f"      断更 {len(stale_updates)} / 北极星 {len(north)} / 滞后 {len(risk)} / 逾期 {len(overdue)} / Triage {len(triage)} / 入库数 {'有' if ingest else '无(退回文字)'}")
     if dry:
         print("\n--- DRY_RUN,以下是将要发送的内容 ---\n")
         print(text)
