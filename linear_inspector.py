@@ -27,6 +27,7 @@ MAX_ROWS = 20                                    # 每段最多列多少行
 
 TEAM_ID = "edcafc58-b719-4c02-923c-21b70e7e830c"     # Data Set (DTS)
 NORTH_STAR_PROJECT_ID = "7364cd38-c394-40be-9c59-2a3422acc6da"  # 数据总览
+DASHBOARD_URL = ""     # 填 Databricks 入库量/覆盖率看板链接;留空则显示"见看板"文字
 
 # 9 个项目:(name, id, lead 显示名)
 PROJECTS = [
@@ -74,6 +75,7 @@ query($after:String,$filter:IssueFilter){
       assignee{ displayName name }
       project{ name }
       state{ name type }
+      labels{ nodes{ name } }
     }
   }
 }
@@ -123,6 +125,15 @@ def norm_progress(p):
     return p / 100.0 if p > 1 else float(p)
 
 
+def is_parent(it):
+    """Parent/渠道总览是追踪容器,不按活跃任务催更。标签含 Parent 或标题含 Parent Issue 即算。"""
+    title = (it.get("title") or "").lower()
+    if "parent issue" in title or "[parent]" in title or "【parent" in title:
+        return True
+    labs = ((it.get("labels") or {}).get("nodes")) or []
+    return any((l.get("name") == "Parent") for l in labs)
+
+
 # ====== 各段计算 ======
 def check_project_updates(projects_by_id, now):
     """① 项目 update 断更。返回 [(name, lead, stale_days 或 None=从未发)]"""
@@ -150,7 +161,7 @@ def collect_milestones(projects_by_id, now):
     if ns:
         for m in (ns.get("projectMilestones") or {}).get("nodes") or []:
             if str(m.get("name", "")).startswith("📈"):
-                north.append(f"{m['name']} — 进度 {round(norm_progress(m.get('progress'))*100)}%")
+                north.append(m["name"])  # 名字里已含目标(→10.2M/12M);进度是手填指标,不显示 %
 
     risk = []
     today = now.date()
@@ -160,6 +171,8 @@ def collect_milestones(projects_by_id, now):
             continue
         start = node.get("startDate")
         for m in (node.get("projectMilestones") or {}).get("nodes") or []:
+            if str(m.get("name", "")).startswith("📈"):
+                continue  # 📈 指标型 milestone 进度手填、常年 0%,不做自动滞后判断(避免误报)
             td = m.get("targetDate")
             if not td:
                 continue
@@ -199,6 +212,8 @@ def split_issues(issues, now):
             if stale > TRIAGE_STALE_DAYS or no_assignee:
                 triage.append({**it, "_stale": stale, "_noassignee": no_assignee})
         elif st == "started":
+            if is_parent(it):
+                continue  # Parent/追踪容器不催更
             prio = it.get("priority")
             th = OVERDUE_THRESHOLD_DAYS.get(prio)
             if th is None:
@@ -238,7 +253,10 @@ def build_message(stale_updates, north, risk, overdue, triage):
         lines.append("北极星:" + " · ".join(north))
     for r in risk[:MAX_ROWS]:
         lines.append(r)
-    lines.append("_当月实际增量请对照 Databricks 看板确认 vs ~60 万/月轨迹_")
+    if DASHBOARD_URL:
+        lines.append(f"实时入库量看板:{DASHBOARD_URL}")
+    else:
+        lines.append("_实时入库量 / 覆盖率见 Databricks 看板;对照 ~60 万/月轨迹判断进度_")
     lines.append("")
 
     # ③
@@ -253,6 +271,8 @@ def build_message(stale_updates, north, risk, overdue, triage):
             proj = (it.get("project") or {}).get("name") or "无 project"
             who = mention((it.get("assignee") or {}).get("displayName") or "未分配")
             lines.append(f"• <{it['url']}|{it['identifier']}> {it['title']} ｜ {who} ｜ {proj} ｜ *{int(it['_stale'])} 天未更新*")
+        if len(overdue) > MAX_ROWS:
+            lines.append(f"…还有 {len(overdue) - MAX_ROWS} 条未展示(共 {len(overdue)} 条逾期)")
         lines.append("")
 
     # ④
