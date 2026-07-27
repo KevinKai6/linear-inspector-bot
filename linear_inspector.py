@@ -69,6 +69,19 @@ MENTIONS = {
     # 未列的人自动退回纯文本 @名字(不弹通知),按需再加
 }
 
+# 项目短名 → 该项目 Lead 的 Slack id(⑤ 记分牌里给每个项目的欠账数 @上负责人)
+PROJECT_LEAD = {
+    "数据获取": "U07L36K9YLX",       # Ivan
+    "数据处理": "U0937391ZAQ",       # Zee
+    "数据清洗": "U09KGM0T6TY",       # Yaqi
+    "合成数据": "U091WJNGVB3",       # Noah
+    "数据标注": "U0A86CRV66N",       # Sage
+    "数据修复与专项": "U0AAB01J1C4",  # River
+    "数据分析研究": "U0AAB01J1C4",    # Jianqiao
+    "数据基建": "U0937391ZAQ",       # Zee
+    "数据总览": "U04UP2HKEUF",       # Kai
+}
+
 LINEAR_API = "https://api.linear.app/graphql"
 
 # ====== GraphQL ======
@@ -356,8 +369,9 @@ def build_message(stale_updates, north, risk, overdue, triage, ingest=None, no_d
             p = ((it.get("project") or {}).get("name") or "无 project").split(" Data")[0].strip()
             by_proj[p] = by_proj.get(p, 0) + 1
         parts = sorted(by_proj.items(), key=lambda kv: -kv[1])
+        seg = " · ".join(f"{p} {c}" + (f"（<@{PROJECT_LEAD[p]}>）" if p in PROJECT_LEAD else "") for p, c in parts)
         lines.append("*⑤ 缺 Target Date（进行中却没填,HR 要求每条都要有）*")
-        lines.append(f"共 *{len(no_date)}* 条进行中 issue 没填交付日期 —— " + " · ".join(f"{p} {c}" for p, c in parts))
+        lines.append(f"共 *{len(no_date)}* 条进行中 issue 没填交付日期 —— " + seg)
         lines.append("请各 Lead 在自己项目里把进行中 issue 的 target date 补齐(Linear 筛 In Progress + 无 due date)")
         lines.append("")
 
