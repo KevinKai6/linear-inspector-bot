@@ -90,7 +90,7 @@ query($after:String,$filter:IssueFilter){
   issues(first:100, after:$after, filter:$filter){
     pageInfo{ hasNextPage endCursor }
     nodes{
-      identifier title priority updatedAt createdAt url
+      identifier title priority updatedAt createdAt url dueDate
       assignee{ displayName name }
       project{ name }
       state{ name type }
@@ -260,8 +260,8 @@ def collect_milestones(projects_by_id, now):
 
 
 def split_issues(issues, now):
-    """③ 逾期(started, Urgent/High) + ④ Triage 积压"""
-    overdue, triage = [], []
+    """③ 逾期(started, Urgent/High) + ④ Triage 积压 + ⑤ 缺 target date(started/unstarted)"""
+    overdue, triage, no_date = [], [], []
     for it in issues:
         st = (it.get("state") or {}).get("type")
         if st == "triage":
@@ -269,9 +269,14 @@ def split_issues(issues, now):
             no_assignee = not it.get("assignee")
             if stale > TRIAGE_STALE_DAYS or no_assignee:
                 triage.append({**it, "_stale": stale, "_noassignee": no_assignee})
-        elif st == "started":
-            if is_parent(it):
-                continue  # Parent/追踪容器不催更
+            continue
+        if is_parent(it):
+            continue  # Parent/追踪容器:既不催更也不要求 target date
+        # ⑤ 缺 target date:只查进行中(Todo 未排期没日期属正常,不催)
+        if st == "started" and not it.get("dueDate"):
+            no_date.append(it)
+        # ③ 逾期只看进行中
+        if st == "started":
             prio = it.get("priority")
             th = OVERDUE_THRESHOLD_DAYS.get(prio)
             if th is None:
@@ -281,7 +286,8 @@ def split_issues(issues, now):
                 overdue.append({**it, "_stale": stale})
     overdue.sort(key=lambda x: (x["priority"], -x["_stale"]))
     triage.sort(key=lambda x: -x["_stale"])
-    return overdue, triage
+    no_date.sort(key=lambda x: ((x.get("state") or {}).get("type") != "started", x.get("priority") or 9))
+    return overdue, triage, no_date
 
 
 # ====== 消息拼装(Slack mrkdwn) ======
@@ -290,8 +296,9 @@ def iso_week():
     return f"{y}-W{w:02d}"
 
 
-def build_message(stale_updates, north, risk, overdue, triage, ingest=None):
+def build_message(stale_updates, north, risk, overdue, triage, ingest=None, no_date=None):
     week = iso_week()
+    no_date = no_date or []
     lines = [f"📋 *数据集 Linear 周巡查 · {week}*", ""]
 
     # ①
@@ -342,9 +349,21 @@ def build_message(stale_updates, north, risk, overdue, triage, ingest=None):
             lines.append(f"• <{it['url']}|{it['identifier']}> {it['title']} ｜ 停留 *{int(it['_stale'])} 天*{extra}")
         lines.append("")
 
-    lines.append("_检查范围:Data Set team ｜ update 阈值 7 天 ｜ issue 阈值 Urgent>2 / High>7 天_")
+    # ⑤ 缺 target date —— 系统性缺口,用记分牌(总数+按项目)而非逐条列,让各 Lead 自己补
+    if no_date:
+        by_proj = {}
+        for it in no_date:
+            p = ((it.get("project") or {}).get("name") or "无 project").split(" Data")[0].strip()
+            by_proj[p] = by_proj.get(p, 0) + 1
+        parts = sorted(by_proj.items(), key=lambda kv: -kv[1])
+        lines.append("*⑤ 缺 Target Date（进行中却没填,HR 要求每条都要有）*")
+        lines.append(f"共 *{len(no_date)}* 条进行中 issue 没填交付日期 —— " + " · ".join(f"{p} {c}" for p, c in parts))
+        lines.append("请各 Lead 在自己项目里把进行中 issue 的 target date 补齐(Linear 筛 In Progress + 无 due date)")
+        lines.append("")
 
-    if not stale_updates and not risk and not overdue and not triage:
+    lines.append("_检查范围:Data Set team ｜ update 阈值 7 天 ｜ 逾期 Urgent>2 / High>7 天 ｜ 每条 issue 需有 target date_")
+
+    if not stale_updates and not risk and not overdue and not triage and not no_date:
         return "📋 *数据集 Linear 周巡查 · %s*\n本周数据侧 Linear 一切在轨 ✅（update 齐、无逾期、无 Triage 积压）" % week
     return "\n".join(lines)
 
@@ -393,7 +412,7 @@ def main():
 
         stale_updates = check_project_updates(projects_by_id, now)
         north, risk = collect_milestones(projects_by_id, now)
-        overdue, triage = split_issues(issues, now)
+        overdue, triage, no_date = split_issues(issues, now)
         ingest = query_databricks()   # 实时入库数;失败自动 None
     except Exception as e:
         msg = f"⚠️ 周巡查 bot 执行异常: {str(e)[:200]}"
@@ -405,10 +424,10 @@ def main():
                 pass
         return 1
 
-    text = build_message(stale_updates, north, risk, overdue, triage, ingest)
+    text = build_message(stale_updates, north, risk, overdue, triage, ingest, no_date)
 
     print("[3/3] 输出…")
-    print(f"      断更 {len(stale_updates)} / 北极星 {len(north)} / 滞后 {len(risk)} / 逾期 {len(overdue)} / Triage {len(triage)} / 入库数 {'有' if ingest else '无(退回文字)'}")
+    print(f"      断更 {len(stale_updates)} / 北极星 {len(north)} / 滞后 {len(risk)} / 逾期 {len(overdue)} / Triage {len(triage)} / 缺date {len(no_date)} / 入库数 {'有' if ingest else '无(退回文字)'}")
     if dry:
         print("\n--- DRY_RUN,以下是将要发送的内容 ---\n")
         print(text)
